@@ -55,6 +55,20 @@
   .legend { display:flex; gap:16px; align-items:center; font-size:11px; color:var(--dim); margin-top:8px; flex-wrap:wrap; }
   .legend .gap { cursor:default; }
   .legend .gap:hover { background:transparent; }
+  /* 备选方案 */
+  .alts { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; align-items:center; }
+  .alts button { padding:5px 12px; font-size:12px; }
+  .alts button.alt { background:transparent; border:1px solid var(--border); color:var(--dim); }
+  .alts button.alt.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .alts .altinfo { font-size:11px; color:var(--dim); margin-left:4px; }
+  .alts .nomore { font-size:12px; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:5px 10px; }
+  /* 当前方案的分段断点标记(词序列预览) */
+  .gap.bp::after { background:var(--accent); width:3px; top:2px; bottom:2px; box-shadow:0 0 4px var(--accent); }
+  .gap.bp.diff::after { background:#f5a524; width:3px; top:1px; bottom:1px; box-shadow:0 0 5px #f5a524; }
+  .gap.bp-missing::after { background:transparent; width:8px; height:8px; top:50%; bottom:auto; border:1.5px solid var(--accent); border-radius:50%; transform:translate(-50%,-50%); }
+  .seg.diffbreak { border-color:#f5a524; box-shadow:0 0 0 1px #f5a524 inset; }
+  .seg .badtag { color:#f5a524; font-size:11px; font-weight:600; }
+  .altlegend { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); margin:2px 0 10px; flex-wrap:wrap; }
 </style>
 </head>
 <body>
@@ -112,6 +126,8 @@
       <div class="row"><input type="range" id="w_imbalance" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_imbalance_v">1.0</span></div>
       <label>权重 · 不自然停顿</label>
       <div class="row"><input type="range" id="w_pause" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_pause_v">1.0</span></div>
+      <label>备选方案数量(1–5,K-best)</label>
+      <div class="row"><input type="number" id="alternatives" value="1" min="1" max="5" step="1" style="width:80px"><span class="hint" style="margin-top:0">大于 1 时预览中可在总代价从低到高的备选方案间切换。</span></div>
     </div>
   </div>
 
@@ -235,6 +251,13 @@ $("wordflow").addEventListener("click", e => {
   schedule();
 });
 
+$("result").addEventListener("click", e => {
+  const btn = e.target.closest("[data-alt]");
+  if (!btn || !altPlans) return;
+  const i = +btn.dataset.alt;
+  if (i !== altIndex) renderPlan(i);
+});
+
 let timer = null;
 function schedule() { clearTimeout(timer); timer = setTimeout(run, 250); }
 
@@ -268,19 +291,64 @@ async function run() {
     .sort((a, b) => a[0] - b[0])
     .map(([k, t]) => ({ index: k, type: t === "must" ? "must_break" : "no_break" }));
 
+  let alternatives = parseInt($("alternatives").value, 10);
+  if (!Number.isFinite(alternatives) || alternatives < 1) alternatives = 1;
+  if (alternatives > 5) alternatives = 5;
+  $("alternatives").value = alternatives;
+
   const res = await fetch("/api/segment", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ words, phrases, shots, boundaries, config: cfg }),
+    body: JSON.stringify({ words, phrases, shots, boundaries, alternatives, config: cfg }),
   });
   const data = await res.json();
   if (!res.ok) { $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return; }
   render(data);
 }
 
+// 当前响应与选中的方案名次
+let curData = null;
+let altPlans = null;
+let altIndex = 0;
+
+function planBreakSet(segments) {
+  // 词间隙断点集合: 每段首词下标(0 除外)即其左侧间隙
+  const set = new Set();
+  for (const s of segments) {
+    const k = s.word_range[0];
+    if (k > 0) set.add(k);
+  }
+  return set;
+}
+
+function clearBreakMarks() {
+  document.querySelectorAll("#wordflow .gap.bp, #wordflow .gap.bp-missing")
+    .forEach(g => g.classList.remove("bp", "diff", "bp-missing"));
+}
+
+function markPlanBreaks(segments, bestSet) {
+  clearBreakMarks();
+  if (!bestSet) return;
+  const cur = planBreakSet(segments);
+  for (const g of document.querySelectorAll("#wordflow [data-gap]")) {
+    const k = +g.dataset.gap;
+    if (g.classList.contains("must") || g.classList.contains("no")) continue;  // 不覆盖用户硬约束标记
+    if (cur.has(k)) {
+      g.classList.add("bp");
+      if (!bestSet.has(k)) g.classList.add("diff");
+    } else if (bestSet.has(k)) {
+      g.classList.add("bp-missing");  // 最优方案在此断开, 当前方案没有
+    }
+  }
+}
+
 function render(data) {
+  curData = data;
+  altPlans = data.ok && data.alternatives ? data.alternatives : null;
+  altIndex = 0;
   const el = $("result");
   if (!data.ok) {
+    clearBreakMarks();
     const c = data.conflict;
     const b = c.boundary;
     const btxt = b
@@ -304,14 +372,54 @@ function render(data) {
     });
     return;
   }
-  el.innerHTML = `<div class="total">共 <b>${data.segments.length}</b> 段 · 总代价 <b>${data.total_cost}</b></div>` +
-    data.segments.map((s, i) => `<div class="seg">
+  renderPlan(0);
+}
+
+function renderPlan(idx) {
+  altIndex = idx;
+  const el = $("result");
+  const segments = altPlans ? altPlans[idx].segments : curData.segments;
+  const totalCost = altPlans ? altPlans[idx].total_cost : curData.total_cost;
+  const multi = altPlans && altPlans.length > 1;
+  const bestSet = multi ? planBreakSet(altPlans[0].segments) : null;
+  const curSet = multi ? planBreakSet(segments) : null;
+  markPlanBreaks(segments, bestSet);
+
+  let switcher = "";
+  let legend = "";
+  if (altPlans) {
+    if (!multi) {
+      switcher = `<div class="alts"><span class="nomore">只有一个可行方案,无更多备选</span></div>`;
+    } else {
+      switcher = `<div class="alts">` + altPlans.map((a, i) => {
+        const active = i === altIndex;
+        const label = i === 0 ? "最优方案" : `方案 ${i + 1}`;
+        const extra = i === 0 ? "" : ` <span class="altinfo">+${a.cost_delta}</span>`;
+        return `<button type="button" class="alt${active ? " active" : ""}" data-alt="${i}">${label}${extra}</button>`;
+      }).join("") + `</div>`;
+      legend = `<div class="altlegend">
+        <span class="row" style="gap:4px"><span class="gap bp"></span>当前方案断点(与最优一致)</span>
+        <span class="row" style="gap:4px"><span class="gap bp diff"></span>与最优方案不同的断点</span>
+        <span class="row" style="gap:4px"><span class="gap bp-missing"></span>最优有、当前没有的断点</span>
+      </div>`;
+    }
+  }
+
+  const deltaTxt = multi ? (idx === 0 ? " · 最优" : ` · 相对最优 +${altPlans[idx].cost_delta}`) : "";
+  el.innerHTML = switcher + legend +
+    `<div class="total">共 <b>${segments.length}</b> 段 · 总代价 <b>${totalCost}</b>${deltaTxt}</div>` +
+    segments.map((s, i) => {
+      // 段首断点(词 s.word_range[0] 左侧间隙)与最优方案不同则突出
+      const diff = multi && s.word_range[0] > 0 && !bestSet.has(s.word_range[0]);
+      const tag = diff ? ` <span class="badtag">断点不同于最优</span>` : "";
+      return `<div class="seg${diff ? " diffbreak" : ""}">
       <div class="meta"><span>#${i + 1}</span><span>${fmt(s.start)} → ${fmt(s.end)}</span>
-        <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${s.word_range[0]}–${s.word_range[1]}</span></div>
+        <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${s.word_range[0]}–${s.word_range[1]}</span>${tag}</div>
       <div class="lines">${s.lines.map(l => `<div>${escapeHtml(l)}</div>`).join("<br>")}</div>
       <div class="cost"><span>镜头 <b>${s.cost.shot}</b></span><span>行长 <b>${s.cost.imbalance}</b></span>
         <span>停顿 <b>${s.cost.pause}</b></span><span>合计 <b>${s.cost.total}</b></span></div>
-    </div>`).join("");
+    </div>`;
+    }).join("");
 }
 
 const EXAMPLE = `00:00:00.500 00:00:00.900 我们
@@ -337,7 +445,7 @@ $("fillExample").onclick = () => {
   schedule();
 };
 
-for (const id of ["words", "phrases", "shots"]) $(id).addEventListener("input", schedule);
+for (const id of ["words", "phrases", "shots", "alternatives"]) $(id).addEventListener("input", schedule);
 for (const id of ["max_chars_per_line", "max_cps", "min_duration", "max_duration"]) $(id).addEventListener("input", schedule);
 for (const id of ["w_shot", "w_imbalance", "w_pause"]) $(id).addEventListener("input", () => {
   $(id + "_v").textContent = parseFloat($(id).value).toFixed(1);
