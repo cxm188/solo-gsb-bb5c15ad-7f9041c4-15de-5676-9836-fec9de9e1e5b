@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字幕断句</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --border:#2c313a; --fg:#e6e8eb; --dim:#9aa3af; --accent:#4f9cf9; --bad:#f97066; --ok:#34c98e; --ph:#7a5af8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 24px; border-bottom:1px solid var(--border); font-size:18px; font-weight:600; }
+  main { display:grid; grid-template-columns: 420px 1fr; gap:16px; padding:16px 24px; align-items:start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  .panel h2 { margin:0 0 10px; font-size:14px; color:var(--dim); font-weight:600; }
+  textarea { width:100%; background:#101216; color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:8px; font-family:ui-monospace, Consolas, monospace; font-size:12px; resize:vertical; }
+  input[type=number], input[type=text] { width:100%; background:#101216; color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:8px 0 4px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; }
+  .row { display:flex; align-items:center; gap:8px; }
+  input[type=range] { flex:1; accent-color:var(--accent); }
+  .wval { width:38px; text-align:right; font-size:12px; color:var(--dim); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:7px 14px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--dim); }
+  .hint { font-size:11px; color:var(--dim); margin-top:6px; line-height:1.5; }
+  .error { color:var(--bad); font-size:13px; margin-top:8px; white-space:pre-wrap; }
+  .total { font-size:13px; color:var(--dim); margin-bottom:10px; }
+  .total b { color:var(--fg); font-size:16px; }
+  .seg { background:#101216; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px; }
+  .seg .meta { font-size:11px; color:var(--dim); margin-bottom:6px; display:flex; gap:12px; flex-wrap:wrap; }
+  .seg .lines { text-align:center; margin:6px 0; }
+  .seg .lines div { display:inline-block; background:#000; color:#fff; font-size:16px; line-height:1.5; padding:2px 10px; border-radius:4px; margin:2px 0; }
+  .seg .cost { font-size:11px; color:var(--dim); display:flex; gap:12px; flex-wrap:wrap; border-top:1px dashed var(--border); padding-top:6px; }
+  .seg .cost b { color:var(--fg); }
+  .conflict { border:1px solid var(--bad); background:#2a1518; border-radius:8px; padding:12px 14px; }
+  .conflict h3 { margin:0 0 6px; color:var(--bad); font-size:14px; }
+  .conflict p { margin:4px 0; font-size:13px; }
+  .conflict ul { margin:6px 0 0; padding-left:18px; font-size:12px; color:var(--dim); }
+  /* 词序列与边界约束 */
+  #wordflow { font-size:12px; line-height:2.2; word-break:break-all; }
+  #wordflow .w { display:inline-block; background:#101216; border:1px solid var(--border); border-radius:4px; padding:0 5px; margin:1px 0; vertical-align:middle; }
+  #wordflow .w i { color:var(--accent); font-style:normal; margin-right:3px; }
+  #wordflow .w.ph { border-color:var(--ph); background:#1a1530; }
+  #wordflow .w.bad { border-color:var(--bad); background:#2a1518; }
+  .gap { display:inline-block; width:16px; height:18px; vertical-align:middle; position:relative; cursor:pointer; border-radius:3px; }
+  .gap::after { content:""; position:absolute; left:50%; top:4px; bottom:4px; width:2px; transform:translateX(-50%); background:#3a4150; border-radius:1px; }
+  .gap:hover { background:#23272f; }
+  .gap.must::after { background:var(--bad); width:3px; top:2px; bottom:2px; box-shadow:0 0 4px var(--bad); }
+  .gap.no::after { background:var(--ok); width:12px; height:3px; top:50%; bottom:auto; transform:translate(-50%,-50%); border-radius:2px; box-shadow:0 0 4px var(--ok); }
+  .gap.locked { width:8px; cursor:not-allowed; }
+  .gap.locked::after { background:var(--ph); opacity:.55; }
+  .gap.clash { background:#3a1d20; box-shadow:0 0 0 1px var(--bad); animation:pulse 1s infinite; }
+  .gap.clash::after { background:var(--bad); }
+  @keyframes pulse { 50% { opacity:.45; } }
+  .legend { display:flex; gap:16px; align-items:center; font-size:11px; color:var(--dim); margin-top:8px; flex-wrap:wrap; }
+  .legend .gap { cursor:default; }
+  .legend .gap:hover { background:transparent; }
+</style>
+</head>
+<body>
+<header>字幕断句 · 全局动态规划</header>
+<main>
+  <div>
+    <div class="panel">
+      <h2>词序列(带时间戳)</h2>
+      <textarea id="words" rows="8" spellcheck="false" placeholder="00:00:01.000 00:00:01.400 我们
+00:00:01.400 00:00:01.800 今天
+..."></textarea>
+      <div class="hint">每行一个词:<code>开始 结束 文本</code>,时间支持 <code>HH:MM:SS.mmm</code> 或秒数;也可直接粘贴 JSON 数组 [{"text","start","end"}]。</div>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" id="fillExample" type="button">填入示例</button>
+      </div>
+      <div class="error" id="parseError"></div>
+    </div>
+
+    <div class="panel">
+      <h2>词序列 · 边界约束</h2>
+      <div id="wordflow"><span class="hint">输入词序列后,在此点击词间间隙设置边界约束。</span></div>
+      <div class="legend">
+        <span class="row" style="gap:4px"><span class="gap must"></span>必须断开</span>
+        <span class="row" style="gap:4px"><span class="gap no"></span>禁止断开</span>
+        <span class="row" style="gap:4px"><span class="gap locked"></span>短语内部(不可设置)</span>
+      </div>
+      <div class="hint">点击词间间隙依次切换:必须断开 → 禁止断开 → 清除。约束随请求提交并作为硬条件生效;不可拆短语内部的间隙不可设置。</div>
+    </div>
+
+    <div class="panel">
+      <h2>不可拆短语</h2>
+      <textarea id="phrases" rows="3" spellcheck="false" placeholder="3-6
+人工智能"></textarea>
+      <div class="hint">每行一个:词下标区间(如 <code>3-6</code>,含端点)或短语原文(自动匹配首个连续出现)。下标见上方词序列预览。</div>
+    </div>
+
+    <div class="panel">
+      <h2>镜头切点</h2>
+      <textarea id="shots" rows="3" spellcheck="false" placeholder="00:00:04.500
+8.2"></textarea>
+      <div class="hint">每行一个时间点,格式同词序列时间。</div>
+    </div>
+
+    <div class="panel">
+      <h2>约束与权重</h2>
+      <div class="grid2">
+        <div><label>单行最大字符</label><input type="number" id="max_chars_per_line" value="42" min="5" max="200"></div>
+        <div><label>最大阅读速度(字/秒)</label><input type="number" id="max_cps" value="20" min="1" max="60" step="0.5"></div>
+        <div><label>最短时长(秒)</label><input type="number" id="min_duration" value="0.8" min="0" step="0.1"></div>
+        <div><label>最长时长(秒)</label><input type="number" id="max_duration" value="7" min="0.5" step="0.1"></div>
+      </div>
+      <label>权重 · 镜头切点偏差</label>
+      <div class="row"><input type="range" id="w_shot" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_shot_v">1.0</span></div>
+      <label>权重 · 行长不均</label>
+      <div class="row"><input type="range" id="w_imbalance" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_imbalance_v">1.0</span></div>
+      <label>权重 · 不自然停顿</label>
+      <div class="row"><input type="range" id="w_pause" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_pause_v">1.0</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>断句预览</h2>
+      <div id="result"><span class="hint">粘贴词序列后自动计算。</span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function parseTime(s) {
+  s = s.trim();
+  if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  const m = s.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})[,.](\d{1,3})$/);
+  if (!m) throw new Error("无法解析时间: " + s);
+  const [, h, mm, ss, ms] = m;
+  return (parseInt(h || 0) * 3600) + parseInt(mm) * 60 + parseInt(ss) + parseInt(ms.padEnd(3, "0")) / 1000;
+}
+
+function parseWords(text) {
+  text = text.trim();
+  if (!text) return [];
+  if (text.startsWith("[")) {
+    const arr = JSON.parse(text);
+    return arr.map(o => ({ text: String(o.text), start: +o.start, end: +o.end }));
+  }
+  return text.split("\n").filter(l => l.trim()).map((line, i) => {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 3) throw new Error(`第 ${i + 1} 行格式错误: ${line}`);
+    return { start: parseTime(parts[0]), end: parseTime(parts[1]), text: parts.slice(2).join(" ") };
+  });
+}
+
+function parseShots(text) {
+  return text.split("\n").map(l => l.trim()).filter(Boolean).map(parseTime);
+}
+
+function parsePhrases(text, words) {
+  const out = [];
+  text.split("\n").map(l => l.trim()).filter(Boolean).forEach(line => {
+    const m = line.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      const a = +m[1], b = +m[2];
+      if (a > b || b >= words.length) throw new Error(`短语区间越界: ${line}`);
+      out.push(Array.from({ length: b - a + 1 }, (_, k) => a + k));
+    } else {
+      const toks = line.split(/\s+/);
+      outer: for (let i = 0; i + toks.length <= words.length; i++) {
+        for (let k = 0; k < toks.length; k++)
+          if (words[i + k].text !== toks[k]) continue outer;
+        out.push(Array.from({ length: toks.length }, (_, k) => i + k));
+        return;
+      }
+      throw new Error(`短语未匹配到连续词序列: ${line}`);
+    }
+  });
+  return out;
+}
+
+function fmt(t) {
+  const m = Math.floor(t / 60), s = (t % 60).toFixed(2).padStart(5, "0");
+  return `${String(m).padStart(2, "0")}:${s}`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 边界约束状态: 词间隙下标 k(词 k-1 与词 k 之间) -> "must" | "no"
+const boundaryState = new Map();
+
+function phraseInnerGaps(phrases) {
+  const inner = new Set();
+  for (const ph of phrases)
+    for (let k = ph[0] + 1; k <= ph[ph.length - 1]; k++) inner.add(k);
+  return inner;
+}
+
+function renderWordFlow(words, phrases) {
+  const inner = phraseInnerGaps(phrases);
+  const inPh = new Set();
+  for (const ph of phrases) ph.forEach(i => inPh.add(i));
+  // 清理失效约束: 越界或落入短语内部
+  for (const k of [...boundaryState.keys()])
+    if (k < 1 || k >= words.length || inner.has(k)) boundaryState.delete(k);
+  const el = $("wordflow");
+  if (!words.length) {
+    el.innerHTML = '<span class="hint">输入词序列后,在此点击词间间隙设置边界约束。</span>';
+    return;
+  }
+  let html = "";
+  words.forEach((w, i) => {
+    html += `<span class="w${inPh.has(i) ? " ph" : ""}" data-w="${i}"><i>${i}</i>${escapeHtml(w.text)}</span>`;
+    if (i + 1 < words.length) {
+      const k = i + 1;
+      if (inner.has(k)) {
+        html += `<span class="gap locked" title="不可拆短语内部,不能设置边界约束"></span>`;
+      } else {
+        const st = boundaryState.get(k) || "";
+        const tip = st === "must" ? "必须断开 · 点击切换为禁止断开"
+                  : st === "no" ? "禁止断开 · 点击清除" : "点击设置必须断开";
+        html += `<span class="gap ${st}" data-gap="${k}" title="${tip}"></span>`;
+      }
+    }
+  });
+  el.innerHTML = html;
+}
+
+$("wordflow").addEventListener("click", e => {
+  const g = e.target.closest("[data-gap]");
+  if (!g) return;
+  const k = +g.dataset.gap;
+  const cur = boundaryState.get(k);
+  if (!cur) boundaryState.set(k, "must");
+  else if (cur === "must") boundaryState.set(k, "no");
+  else boundaryState.delete(k);
+  schedule();
+});
+
+let timer = null;
+function schedule() { clearTimeout(timer); timer = setTimeout(run, 250); }
+
+async function run() {
+  $("parseError").textContent = "";
+  let words;
+  try {
+    words = parseWords($("words").value);
+  } catch (e) {
+    $("parseError").textContent = e.message;
+    $("result").innerHTML = "";
+    renderWordFlow([], []);
+    return;
+  }
+  // 短语/切点解析失败时保留词序列与边界标记,仅提示错误
+  let phrases = [], shots = [];
+  try {
+    phrases = parsePhrases($("phrases").value, words);
+    shots = parseShots($("shots").value);
+  } catch (e) {
+    $("parseError").textContent = e.message;
+  }
+  renderWordFlow(words, phrases);
+  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; return; }
+
+  const cfg = {};
+  for (const k of ["max_chars_per_line", "max_cps", "min_duration", "max_duration", "w_shot", "w_imbalance", "w_pause"])
+    cfg[k] = parseFloat($(k).value);
+
+  const boundaries = [...boundaryState.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([k, t]) => ({ index: k, type: t === "must" ? "must_break" : "no_break" }));
+
+  const res = await fetch("/api/segment", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ words, phrases, shots, boundaries, config: cfg }),
+  });
+  const data = await res.json();
+  if (!res.ok) { $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return; }
+  render(data);
+}
+
+function render(data) {
+  const el = $("result");
+  if (!data.ok) {
+    const c = data.conflict;
+    const b = c.boundary;
+    const btxt = b
+      ? `<p>冲突边界:词 <b>${b.index - 1}</b> 与词 <b>${b.index}</b> 之间 · <b>${b.type === "must_break" ? "必须断开" : "禁止断开"}</b></p>`
+      : "";
+    el.innerHTML = `<div class="conflict">
+      <h3>无可行方案 — 首个冲突区间</h3>
+      ${btxt}
+      <p>词下标 <b>${c.word_range[0]}–${c.word_range[1]}</b> · ${fmt(c.start)} → ${fmt(c.end)}</p>
+      <p>「${escapeHtml(c.text)}」</p>
+      <ul>${c.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+    </div>`;
+    // 高亮冲突: 冲突边界标记 + 冲突词区间(输入与标记保持不变)
+    if (b) {
+      const g = document.querySelector(`[data-gap="${b.index}"]`);
+      if (g) g.classList.add("clash");
+    }
+    document.querySelectorAll("#wordflow .w").forEach(w => {
+      const i = +w.dataset.w;
+      if (i >= c.word_range[0] && i <= c.word_range[1]) w.classList.add("bad");
+    });
+    return;
+  }
+  el.innerHTML = `<div class="total">共 <b>${data.segments.length}</b> 段 · 总代价 <b>${data.total_cost}</b></div>` +
+    data.segments.map((s, i) => `<div class="seg">
+      <div class="meta"><span>#${i + 1}</span><span>${fmt(s.start)} → ${fmt(s.end)}</span>
+        <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${s.word_range[0]}–${s.word_range[1]}</span></div>
+      <div class="lines">${s.lines.map(l => `<div>${escapeHtml(l)}</div>`).join("<br>")}</div>
+      <div class="cost"><span>镜头 <b>${s.cost.shot}</b></span><span>行长 <b>${s.cost.imbalance}</b></span>
+        <span>停顿 <b>${s.cost.pause}</b></span><span>合计 <b>${s.cost.total}</b></span></div>
+    </div>`).join("");
+}
+
+const EXAMPLE = `00:00:00.500 00:00:00.900 我们
+00:00:00.900 00:00:01.200 今天
+00:00:01.200 00:00:01.600 来看
+00:00:01.600 00:00:01.900 一个
+00:00:02.100 00:00:02.600 非常重要
+00:00:02.600 00:00:02.900 的
+00:00:02.900 00:00:03.300 例子
+00:00:04.800 00:00:05.100 首先
+00:00:05.100 00:00:05.500 我们
+00:00:05.500 00:00:05.900 需要
+00:00:05.900 00:00:06.300 理解
+00:00:06.300 00:00:06.800 动态规划
+00:00:06.800 00:00:07.100 的
+00:00:07.100 00:00:07.500 核心
+00:00:07.500 00:00:07.900 思想`;
+
+$("fillExample").onclick = () => {
+  $("words").value = EXAMPLE;
+  $("phrases").value = "动态规划";
+  $("shots").value = "00:00:04.500\n00:00:08.000";
+  schedule();
+};
+
+for (const id of ["words", "phrases", "shots"]) $(id).addEventListener("input", schedule);
+for (const id of ["max_chars_per_line", "max_cps", "min_duration", "max_duration"]) $(id).addEventListener("input", schedule);
+for (const id of ["w_shot", "w_imbalance", "w_pause"]) $(id).addEventListener("input", () => {
+  $(id + "_v").textContent = parseFloat($(id).value).toFixed(1);
+  schedule();
+});
+</script>
+</body>
+</html>
