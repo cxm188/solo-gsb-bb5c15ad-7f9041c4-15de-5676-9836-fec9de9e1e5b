@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>字幕断句</title>
 <style>
-  :root { --bg:#14161a; --panel:#1d2026; --border:#2c313a; --fg:#e6e8eb; --dim:#9aa3af; --accent:#4f9cf9; --bad:#f97066; --ok:#34c98e; --ph:#7a5af8; }
+  :root { --bg:#14161a; --panel:#1d2026; --border:#2c313a; --fg:#e6e8eb; --dim:#9aa3af; --accent:#4f9cf9; --bad:#f97066; --ok:#34c98e; --ph:#7a5af8; --alt:#f5b544; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background:var(--bg); color:var(--fg); }
   header { padding:14px 24px; border-bottom:1px solid var(--border); font-size:18px; font-weight:600; }
@@ -51,6 +51,26 @@
   .gap.locked::after { background:var(--ph); opacity:.55; }
   .gap.clash { background:#3a1d20; box-shadow:0 0 0 1px var(--bad); animation:pulse 1s infinite; }
   .gap.clash::after { background:var(--bad); }
+  /* 分段断点标记(叠加在间隙下方, 与中心的约束标记互不干扰) */
+  #wordflow { padding-bottom:8px; }
+  .gap.cut::before, .gap.cut-add::before, .gap.cut-miss::before {
+    position:absolute; left:50%; bottom:-5px; transform:translateX(-50%);
+    font-size:9px; line-height:1; pointer-events:none;
+  }
+  .gap.cut::before { content:"\25BE"; color:var(--accent); }
+  .gap.cut-add::before { content:"\25BE"; color:var(--alt); text-shadow:0 0 5px var(--alt); }
+  .gap.cut-miss::before { content:"\25BF"; color:#6b7280; }
+  /* 备选方案切换 */
+  .alts { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .alt-tab { background:#101216; border:1px solid var(--border); color:var(--dim); border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  .alt-tab .tag { font-size:10px; margin-left:5px; }
+  .alt-tab.active { border-color:var(--accent); color:var(--fg); background:#16202e; }
+  .alt-tab .dlt { font-size:11px; margin-left:5px; color:var(--dim); }
+  .alt-tab.active .dlt { color:var(--alt); }
+  .alt-legend { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); margin:2px 0 10px; flex-wrap:wrap; }
+  .alt-legend .mk { font-size:10px; }
+  .seg.alt-cut { border-color:#8a6a1f; }
+  .seg .altflag { color:var(--alt); font-size:11px; }
   @keyframes pulse { 50% { opacity:.45; } }
   .legend { display:flex; gap:16px; align-items:center; font-size:11px; color:var(--dim); margin-top:8px; flex-wrap:wrap; }
   .legend .gap { cursor:default; }
@@ -106,6 +126,8 @@
         <div><label>最短时长(秒)</label><input type="number" id="min_duration" value="0.8" min="0" step="0.1"></div>
         <div><label>最长时长(秒)</label><input type="number" id="max_duration" value="7" min="0.5" step="0.1"></div>
       </div>
+      <label>备选方案数(1～5,K-best 动态规划)</label>
+      <div class="row"><input type="range" id="alternatives" min="1" max="5" step="1" value="3"><span class="wval" id="alternatives_v">3</span></div>
       <label>权重 · 镜头切点偏差</label>
       <div class="row"><input type="range" id="w_shot" min="0" max="5" step="0.1" value="1"><span class="wval" id="w_shot_v">1.0</span></div>
       <label>权重 · 行长不均</label>
@@ -217,7 +239,7 @@ function renderWordFlow(words, phrases) {
         const st = boundaryState.get(k) || "";
         const tip = st === "must" ? "必须断开 · 点击切换为禁止断开"
                   : st === "no" ? "禁止断开 · 点击清除" : "点击设置必须断开";
-        html += `<span class="gap ${st}" data-gap="${k}" title="${tip}"></span>`;
+        html += `<span class="gap ${st}" data-gap="${k}" data-base-tip="${tip}" title="${tip}"></span>`;
       }
     }
   });
@@ -258,11 +280,13 @@ async function run() {
     $("parseError").textContent = e.message;
   }
   renderWordFlow(words, phrases);
+  clearCutMarkers();
   if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; return; }
 
   const cfg = {};
   for (const k of ["max_chars_per_line", "max_cps", "min_duration", "max_duration", "w_shot", "w_imbalance", "w_pause"])
     cfg[k] = parseFloat($(k).value);
+  const nAlts = parseInt($("alternatives").value, 10);
 
   const boundaries = [...boundaryState.entries()]
     .sort((a, b) => a[0] - b[0])
@@ -271,16 +295,63 @@ async function run() {
   const res = await fetch("/api/segment", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ words, phrases, shots, boundaries, config: cfg }),
+    body: JSON.stringify({ words, phrases, shots, boundaries, config: cfg, alternatives: nAlts }),
   });
   const data = await res.json();
-  if (!res.ok) { $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return; }
+  if (!res.ok) {
+    plans = [];
+    planIndex = 0;
+    clearCutMarkers();
+    $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return;
+  }
   render(data);
+}
+
+// 当前响应的全部方案(含最优): [{segments,total_cost,cost_delta}], 及当前选中下标
+let plans = [], planIndex = 0;
+
+function clearCutMarkers() {
+  document.querySelectorAll("#wordflow .gap").forEach(g => {
+    g.classList.remove("cut", "cut-add", "cut-miss");
+    if (g.dataset.cutTip) {
+      delete g.dataset.cutTip;
+      g.title = g.dataset.baseTip || "";
+    }
+  });
+}
+
+function planCuts(segments) {
+  // 断点 = 词间隙下标 k(词 k-1 与词 k 之间); 最后一段末尾 n 不是间隙, 不取
+  return new Set(segments.slice(0, -1).map(s => s.word_range[1] + 1));
+}
+
+function applyCutMarkers(curSegs) {
+  clearCutMarkers();
+  const cur = planCuts(curSegs), best = planCuts(plans[0].segments);
+  for (const k of cur) {
+    const g = document.querySelector(`#wordflow [data-gap="${k}"]`);
+    if (!g) continue;
+    const diff = !best.has(k);
+    g.classList.add(diff ? "cut-add" : "cut");
+    g.dataset.cutTip = diff ? "备选断点: 与最优方案不同" : "分段断点";
+    g.title = `${g.dataset.baseTip || ""} · ${g.dataset.cutTip}`;
+  }
+  for (const k of best) {
+    if (cur.has(k)) continue;
+    const g = document.querySelector(`#wordflow [data-gap="${k}"]`);
+    if (!g) continue;
+    g.classList.add("cut-miss");
+    g.dataset.cutTip = "最优方案在此断开, 当前备选方案未断开";
+    g.title = `${g.dataset.baseTip || ""} · ${g.dataset.cutTip}`;
+  }
 }
 
 function render(data) {
   const el = $("result");
   if (!data.ok) {
+    plans = [];
+    planIndex = 0;
+    clearCutMarkers();
     const c = data.conflict;
     const b = c.boundary;
     const btxt = b
@@ -304,14 +375,64 @@ function render(data) {
     });
     return;
   }
-  el.innerHTML = `<div class="total">共 <b>${data.segments.length}</b> 段 · 总代价 <b>${data.total_cost}</b></div>` +
-    data.segments.map((s, i) => `<div class="seg">
+
+  plans = data.alternatives || [{
+    segments: data.segments, total_cost: data.total_cost, cost_delta: 0,
+  }];
+  planIndex = 0;
+
+  let tabs = "";
+  if (plans.length > 1) {
+    tabs = `<div class="alts">` + plans.map((p, i) =>
+      `<button type="button" class="alt-tab${i === 0 ? " active" : ""}" data-plan="${i}">` +
+      `方案 ${i + 1}<span class="tag">${i === 0 ? "最优" : "备选"}</span>` +
+      `<span class="dlt">${i === 0 ? "" : "+" + p.cost_delta}</span></button>`).join("") +
+      `</div>
+      <div class="alt-legend">
+        <span><span class="mk" style="color:var(--accent)">▾</span> 分段断点(同最优)</span>
+        <span><span class="mk" style="color:var(--alt)">▾</span> 与最优不同的断点</span>
+        <span><span class="mk" style="color:#6b7280">▿</span> 最优方案断点(当前未断)</span>
+      </div>`;
+  }
+
+  let note = "";
+  const want = parseInt($("alternatives").value, 10);
+  if (want > 1 && plans.length === 1) {
+    note = `<div class="hint" style="margin-bottom:10px">无更多备选:在当前硬约束与边界约束下只有一个可行分段方案。</div>`;
+  }
+
+  el.innerHTML = tabs + note + `<div id="planBody"></div>`;
+  if (tabs) el.querySelector(".alts").addEventListener("click", e => {
+    const btn = e.target.closest("[data-plan]");
+    if (!btn) return;
+    planIndex = +btn.dataset.plan;
+    el.querySelectorAll(".alt-tab").forEach(t => t.classList.toggle("active", +t.dataset.plan === planIndex));
+    renderPlan();
+  });
+  renderPlan();
+}
+
+function renderPlan() {
+  const p = plans[planIndex];
+  const bestCuts = planCuts(plans[0].segments);
+  applyCutMarkers(p.segments);
+  const head = planIndex === 0
+    ? `共 <b>${p.segments.length}</b> 段 · 总代价 <b>${p.total_cost}</b> · 最优方案`
+    : `共 <b>${p.segments.length}</b> 段 · 总代价 <b>${p.total_cost}</b> · 相对最优 <b style="color:var(--alt)">+${p.cost_delta}</b>`;
+  $("planBody").innerHTML = `<div class="total">${head}</div>` +
+    p.segments.map((s, i) => {
+      // 段首落在一个断点上: 与最优方案断点集合比较, 不同则该段高亮
+      const k = s.word_range[0];
+      const differs = i > 0 && !bestCuts.has(k);
+      const flag = differs ? ` <span class="altflag">● 断点与最优不同</span>` : "";
+      return `<div class="seg${differs ? " alt-cut" : ""}">
       <div class="meta"><span>#${i + 1}</span><span>${fmt(s.start)} → ${fmt(s.end)}</span>
-        <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${s.word_range[0]}–${s.word_range[1]}</span></div>
+        <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${s.word_range[0]}–${s.word_range[1]}</span>${flag}</div>
       <div class="lines">${s.lines.map(l => `<div>${escapeHtml(l)}</div>`).join("<br>")}</div>
       <div class="cost"><span>镜头 <b>${s.cost.shot}</b></span><span>行长 <b>${s.cost.imbalance}</b></span>
         <span>停顿 <b>${s.cost.pause}</b></span><span>合计 <b>${s.cost.total}</b></span></div>
-    </div>`).join("");
+    </div>`;
+    }).join("");
 }
 
 const EXAMPLE = `00:00:00.500 00:00:00.900 我们
@@ -341,6 +462,10 @@ for (const id of ["words", "phrases", "shots"]) $(id).addEventListener("input", 
 for (const id of ["max_chars_per_line", "max_cps", "min_duration", "max_duration"]) $(id).addEventListener("input", schedule);
 for (const id of ["w_shot", "w_imbalance", "w_pause"]) $(id).addEventListener("input", () => {
   $(id + "_v").textContent = parseFloat($(id).value).toFixed(1);
+  schedule();
+});
+$("alternatives").addEventListener("input", () => {
+  $("alternatives_v").textContent = $("alternatives").value;
   schedule();
 });
 </script>

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .segmenter import Config, solve
 
-app = FastAPI(title="字幕断句", version="1.1.0")
+app = FastAPI(title="字幕断句", version="1.2.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -31,6 +31,8 @@ class SegmentRequest(BaseModel):
     shots: list[float] = Field(default_factory=list)
     boundaries: list[BoundaryIn] = Field(default_factory=list)
     config: dict = Field(default_factory=dict)
+    alternatives: int = Field(default=1, ge=1, le=5,
+                              description="备选方案数(1～5), 大于 1 时响应含 alternatives 数组")
 
 
 @app.post("/api/segment")
@@ -39,7 +41,8 @@ def segment(req: SegmentRequest):
     cfg = Config(**cfg_fields)
     try:
         return solve([w.model_dump() for w in req.words], req.phrases, req.shots, cfg,
-                     boundaries=[b.model_dump() for b in req.boundaries])
+                     boundaries=[b.model_dump() for b in req.boundaries],
+                     alternatives=req.alternatives)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

@@ -12,6 +12,9 @@
   - 不可拆短语(phrase)作为原子单元, 不得被分段或换行拆开
   - 边界约束(boundaries): 指定词间隙必须断开(must_break)或禁止断开(no_break),
     在动态规划中作为硬条件生效; 不可拆短语内部的词间隙不允许设置
+
+备选方案(alternatives): 在全部硬约束不变的前提下, 用 K-best 动态规划枚举
+总代价从低到高的至多 K 个互不重复方案(按分段边界序列判重)。
 """
 
 from __future__ import annotations
@@ -177,6 +180,28 @@ def pause_cost(gap: float, cfg: Config) -> float:
     return min(1.0, (cfg.pause_threshold - gap) / cfg.pause_threshold)
 
 
+def _must_break_lo(mb: set[int], n: int) -> list[int]:
+    """lo[j]: 转移 i→j 合法要求 i >= lo[j](不得跨过小于 j 的 must_break 边界)。"""
+    lo = [0] * (n + 1)
+    for j in range(1, n + 1):
+        lo[j] = max(lo[j - 1], j - 1 if (j - 1) in mb else 0)
+    return lo
+
+
+def _edge_cost(units: list[Unit], cost_parts: list[list[dict]],
+               cfg: Config, shots: list[float], i: int, j: int) -> float:
+    """转移 i→j(段 units[i:j])的加权代价, 与动态规划取值完全一致。"""
+    p = cost_parts[i][j - 1]
+    c_shot = p["crossing"] * cfg.crossing_penalty
+    c_pause = 0.0
+    if i > 0:  # 段首边界(非全文开头): 切点偏差 + 停顿
+        c_shot += boundary_shot_cost(units[i].start, shots, cfg)
+        c_pause = pause_cost(units[i].start - units[i - 1].end, cfg)
+    return (cfg.w_shot * c_shot
+            + cfg.w_imbalance * p["imbalance"]
+            + cfg.w_pause * c_pause)
+
+
 def _run_dp(units: list[Unit], feasible: list[list[bool]], cost_parts: list[list[dict]],
             cfg: Config, shots: list[float], mb: set[int], nb: set[int]):
     """全局 DP: dp[j] = 前 j 个单元的最小加权总代价。
@@ -187,10 +212,7 @@ def _run_dp(units: list[Unit], feasible: list[list[bool]], cost_parts: list[list
     """
     INF = float("inf")
     n = len(units)
-    # lo[j]: 转移 i→j 合法要求 i >= lo[j](不得跨过小于 j 的 must_break 边界)
-    lo = [0] * (n + 1)
-    for j in range(1, n + 1):
-        lo[j] = max(lo[j - 1], j - 1 if (j - 1) in mb else 0)
+    lo = _must_break_lo(mb, n)
     dp = [INF] * (n + 1)
     prev = [-1] * (n + 1)
     dp[0] = 0.0
@@ -200,24 +222,106 @@ def _run_dp(units: list[Unit], feasible: list[list[bool]], cost_parts: list[list
                 continue
             if dp[i] == INF or not feasible[i][j - 1]:
                 continue
-            p = cost_parts[i][j - 1]
-            c_shot = p["crossing"] * cfg.crossing_penalty
-            c_pause = 0.0
-            if i > 0:  # 段首边界(非全文开头): 切点偏差 + 停顿
-                t = units[i].start
-                c_shot += boundary_shot_cost(t, shots, cfg)
-                c_pause = pause_cost(units[i].start - units[i - 1].end, cfg)
-            total = (cfg.w_shot * c_shot
-                     + cfg.w_imbalance * p["imbalance"]
-                     + cfg.w_pause * c_pause)
+            total = _edge_cost(units, cost_parts, cfg, shots, i, j)
             if dp[i] + total < dp[j]:
                 dp[j] = dp[i] + total
                 prev[j] = i
     return dp, prev
 
 
+# 同一节点上保留「最优代价层并列路径」的数量上限(防止零权重等退化情形指数膨胀)
+_TIE_CAP = 64
+
+
+def _run_dp_kbest(units: list[Unit], feasible: list[list[bool]],
+                  cost_parts: list[list[dict]], cfg: Config, shots: list[float],
+                  mb: set[int], nb: set[int], k: int):
+    """K-best 全局 DP: 返回从 0 到 n 的至多 k 条路径, 按总代价从低到高排列。
+
+    每个节点 j 保留到达 j 的候选: 最优代价层的并列路径全部保留
+    (上限 _TIE_CAP, 防止所有代价均为 0 时的指数膨胀), 再依次纳入严格更高的
+    代价层直到凑满 k 条 —— 这样第 2 名起的方案必与最优存在严格代价差,
+    不会用「同代价的另一种切法」挤占真正的次优层。边代价只取决于转移 i→j,
+    与具体路径无关, 因此按「前驱路径代价 + 转移代价」归并取前 k 条,
+    得到的就是完整问题的 K 个最优解。每条路径以边界序列表示
+    (path = [0, i1, i2, ..., n], 即各分段起止的单元切点)。
+
+    硬约束与单最优 DP 完全相同(must_break / no_break / 可行性表),
+    仅在目标值层面枚举次优方案。
+    """
+    n = len(units)
+    lo = _must_break_lo(mb, n)
+    # best[j]: 到达节点 j 的候选列表 [(cost, path)], 按 cost 升序
+    best: list[list[tuple[float, list[int]]]] = [[] for _ in range(n + 1)]
+    best[0] = [(0.0, [0])]
+    for j in range(1, n + 1):
+        cand: list[tuple[float, list[int]]] = []
+        for i in range(lo[j], j):
+            if i and i in nb:
+                continue
+            if not feasible[i][j - 1]:
+                continue
+            edge = _edge_cost(units, cost_parts, cfg, shots, i, j)
+            for pc, path in best[i]:
+                cand.append((pc + edge, path + [j]))
+        # 稳定排序: 代价相同时保留确定顺序
+        cand.sort(key=lambda x: x[0])
+        kept: list[tuple[float, list[int]]] = []
+        base = None
+        for c, p in cand:
+            if base is None:
+                base = c
+                kept.append((c, p))  # 最优代价层: 并列路径全部保留(至上限)
+                continue
+            if c <= base + 1e-12:
+                if len(kept) < _TIE_CAP:
+                    kept.append((c, p))
+            elif len(kept) < k:
+                kept.append((c, p))  # 更高代价层: 凑满 k 条即止
+            else:
+                break
+        best[j] = kept
+    return best[n]  # [(cost, path), ...] 升序
+
+
+def _build_segments(units: list[Unit], cost_parts: list[list[dict]],
+                    cfg: Config, shots: list[float], path: list[int]) -> list[dict]:
+    """按边界序列 path = [0, i1, ..., n] 构造分段结果。"""
+    segments = []
+    for a, b in zip(path, path[1:]):
+        p = cost_parts[a][b - 1]
+        start, end = units[a].start, units[b - 1].end
+        c_shot = p["crossing"] * cfg.crossing_penalty
+        c_pause = 0.0
+        if a > 0:
+            c_shot += boundary_shot_cost(start, shots, cfg)
+            c_pause = pause_cost(units[a].start - units[a - 1].end, cfg)
+        c_shot_w = cfg.w_shot * c_shot
+        c_imb_w = cfg.w_imbalance * p["imbalance"]
+        c_pause_w = cfg.w_pause * c_pause
+        segments.append({
+            "word_range": [units[a].word_indices[0], units[b - 1].word_indices[-1]],
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(p["duration"], 3),
+            "cps": round(p["cps"], 1),
+            "lines": p["lines"],
+            "cost": {
+                "shot": round(c_shot_w, 4),
+                "imbalance": round(c_imb_w, 4),
+                "pause": round(c_pause_w, 4),
+                "total": round(c_shot_w + c_imb_w + c_pause_w, 4),
+            },
+        })
+    return segments
+
+
 def solve(words: list[dict], phrases: list[list[int]], shots: list[float],
-          cfg: Config, boundaries: list[dict] | None = None) -> dict:
+          cfg: Config, boundaries: list[dict] | None = None,
+          alternatives: int = 1) -> dict:
+    if not isinstance(alternatives, int) or isinstance(alternatives, bool) \
+            or not (1 <= alternatives <= 5):
+        raise ValueError("alternatives 必须是 1～5 的整数")
     if not words:
         return {"ok": True, "total_cost": 0.0, "segments": []}
     for i, w in enumerate(words):
@@ -232,7 +336,6 @@ def solve(words: list[dict], phrases: list[list[int]], shots: list[float],
     mb, nb = validate_boundaries(boundaries or [], len(words), phrases, units)
 
     # seg_cost[a][b]: 段 units[a:b+1] 的可行性与代价分解
-    INF = float("inf")
     feasible = [[False] * n for _ in range(n)]
     cost_parts = [[None] * n for _ in range(n)]
     for a in range(n):
@@ -256,47 +359,45 @@ def solve(words: list[dict], phrases: list[list[int]], shots: list[float],
                 "cps": chars / dur if dur > 1e-9 else 0.0,
             }
 
-    dp, prev = _run_dp(units, feasible, cost_parts, cfg, shots, mb, nb)
+    # K-best 动态规划: 硬约束与边界约束全部不变, 仅按总代价从低到高枚举互不重复方案
+    ranked = _run_dp_kbest(units, feasible, cost_parts, cfg, shots, mb, nb,
+                           alternatives)
 
-    if dp[n] == INF:
+    if not ranked:
         return _conflict(units, feasible, cost_parts, cfg, shots, mb, nb)
 
-    # 回溯分段
-    bounds = []
-    j = n
-    while j > 0:
-        i = prev[j]
-        bounds.append((i, j - 1))
-        j = i
-    bounds.reverse()
+    # 按分段边界序列判重(每条路径本就对应唯一边界序列, 此处再做一次防御性去重),
+    # 最终至多取 alternatives 个(内部节点为并列感知会多保留同代价前缀, 终点截取前 k)
+    plans: list[tuple[float, list[int]]] = []
+    seen: set[tuple[int, ...]] = set()
+    for cost, path in ranked:
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        plans.append((cost, path))
+        if len(plans) >= alternatives:
+            break
 
-    segments = []
-    for a, b in bounds:
-        p = cost_parts[a][b]
-        start, end = units[a].start, units[b].end
-        c_shot = p["crossing"] * cfg.crossing_penalty
-        c_pause = 0.0
-        if a > 0:
-            c_shot += boundary_shot_cost(start, shots, cfg)
-            c_pause = pause_cost(units[a].start - units[a - 1].end, cfg)
-        c_shot_w = cfg.w_shot * c_shot
-        c_imb_w = cfg.w_imbalance * p["imbalance"]
-        c_pause_w = cfg.w_pause * c_pause
-        segments.append({
-            "word_range": [units[a].word_indices[0], units[b].word_indices[-1]],
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "duration": round(p["duration"], 3),
-            "cps": round(p["cps"], 1),
-            "lines": p["lines"],
-            "cost": {
-                "shot": round(c_shot_w, 4),
-                "imbalance": round(c_imb_w, 4),
-                "pause": round(c_pause_w, 4),
-                "total": round(c_shot_w + c_imb_w + c_pause_w, 4),
-            },
+    best_cost = plans[0][0]
+    alt_results = []
+    for cost, path in plans:
+        segments = _build_segments(units, cost_parts, cfg, shots, path)
+        alt_results.append({
+            "segments": segments,
+            "total_cost": round(cost, 4),
+            "cost_delta": round(cost - best_cost, 4),
         })
-    return {"ok": True, "total_cost": round(dp[n], 4), "segments": segments}
+
+    result: dict = {
+        "ok": True,
+        "total_cost": alt_results[0]["total_cost"],
+        "segments": alt_results[0]["segments"],
+    }
+    if alternatives > 1:
+        result["alternatives"] = alt_results
+    return result
+
 
 
 def _conflict(units: list[Unit], feasible: list[list[bool]], cost_parts: list[list[dict]],
